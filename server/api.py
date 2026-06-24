@@ -17,7 +17,7 @@ from .openai_format import (
 )
 from .prompt import messages_to_prompt
 from .ratelimit import TokenBucket
-from .schemas import ChatCompletionRequest
+from .schemas import ChatCompletionRequest, ChatMessage
 
 import os
 import hashlib
@@ -26,6 +26,8 @@ proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
 
 # 会话缓存字典，用于历史对话上下文的指纹匹配与 Session 保持
 _session_cache = {}
+# 长前缀缓存字典，用于模糊匹配单条超长 Prompt 发送场景下的 Session 保持（解决 Cline/OpenCode 将历史拼入单条消息的问题）
+_prefix_history = {}
 _cache_lock = threading.Lock()
 
 # 线程局部变量，用于记录每个子线程是否已经完成 curl_cffi 的网络预热
@@ -111,8 +113,8 @@ def _rate_limited_response():
 _upstream_lock = threading.Lock()
 
 
-def _stream(prompt: str, model: str, conversation_id=None, messages=None, mode="smart"):
-    """使用 SSE 机制逐字返回 OpenAI 格式的流式块 (chat.completion.chunk)。"""
+def _stream(prompt: str, model: str, conversation_id=None, messages=None, mode="smart", full_prompt=None):
+    """使用 SSE 机制逐字返回 OpenAI 格式 the 流式块 (chat.completion.chunk)。"""
     _preheat_thread()
 
     cid = new_id()
@@ -150,6 +152,20 @@ def _stream(prompt: str, model: str, conversation_id=None, messages=None, mode="
                         old_keys = list(_session_cache.keys())[:500]
                         for k in old_keys:
                             _session_cache.pop(k, None)
+            
+            # 添加/更新长前缀历史记录以备下一次模糊匹配
+            if actual_cid and (full_prompt or prompt):
+                fp = full_prompt or prompt
+                # 如果当前是在已有前缀基础上进行的增量对话，我们应该记录“完整原始 prompt + 本轮回复”为下一次的前缀
+                if full_prompt and len(reply_pieces) > 0:
+                    fp = full_prompt + "\n" + "".join(reply_pieces)
+                with _cache_lock:
+                    _prefix_history[fp] = actual_cid
+                    if len(_prefix_history) > 1000:
+                        # 仅淘汰最旧的 300 个，避免全部清空
+                        old_keys = list(_prefix_history.keys())[:300]
+                        for k in old_keys:
+                            _prefix_history.pop(k, None)
     except Exception as exc:  # surface errors to the client instead of hanging
         yield sse_event(
             stream_chunk(cid, created, model, {"content": f"\n[error: {exc}]"}, finish="error")
@@ -206,8 +222,26 @@ def chat_completions(req: ChatCompletionRequest):
     if req_conversation_id or prompt_is_last_only:
         from .prompt import content_text
         prompt = content_text(req.messages[-1].content)
+        full_prompt = prompt
     else:
         prompt = messages_to_prompt(req.messages)
+        full_prompt = prompt
+        
+        # 如果无法通过常规的多轮消息列表指纹定位会话，尝试通过本地长前缀哈希做模糊匹配
+        if not req_conversation_id:
+            with _cache_lock:
+                # 优先匹配更长的前缀以获得更高精度
+                sorted_history = sorted(_prefix_history.items(), key=lambda x: len(x[0]), reverse=True)
+                for old_prompt, cid in sorted_history:
+                    # 前缀匹配阈值设为 200 字符，防短指令冲突误匹配
+                    if len(old_prompt) > 200 and prompt.startswith(old_prompt):
+                        diff_prompt = prompt[len(old_prompt):].strip()
+                        if diff_prompt:
+                            req_conversation_id = cid
+                            prompt = diff_prompt
+                            prompt_is_last_only = True
+                            print(f"[PrefixCache] Hit! Reusing conversation_id: {cid}. Stripped {len(old_prompt)} chars. Sending diff: {prompt[:100]}...")
+                            break
 
     if not prompt.strip():
         return JSONResponse(
@@ -223,7 +257,7 @@ def chat_completions(req: ChatCompletionRequest):
     # 流式（SSE）返回处理
     if req.stream:
         return StreamingResponse(
-            _stream(prompt, model, req_conversation_id, req.messages, mode), media_type="text/event-stream"
+            _stream(prompt, model, req_conversation_id, req.messages, mode, full_prompt=full_prompt), media_type="text/event-stream"
         )
 
     # 非流式同步请求处理
@@ -243,7 +277,22 @@ def chat_completions(req: ChatCompletionRequest):
                         old_keys = list(_session_cache.keys())[:500]
                         for k in old_keys:
                             _session_cache.pop(k, None)
+                            
+                # 同时将完整 prompt + 它的回复 记录进前缀匹配库，做下一次增量识别
+                fp = full_prompt
+                if reply.text:
+                    fp = full_prompt + "\n" + reply.text
+                print(f"[DEBUG] Caching prefix: fp_len={len(fp)}, cid={reply.conversation_id}")
+                with _cache_lock:
+                    _prefix_history[fp] = reply.conversation_id
+                    if len(_prefix_history) > 1000:
+                        # 仅淘汰最旧 of 300 个，避免全部清空
+                        old_keys = list(_prefix_history.keys())[:300]
+                        for k in old_keys:
+                            _prefix_history.pop(k, None)
     except Exception as exc:
+        import traceback
+        traceback.print_exc()
         return JSONResponse(
             status_code=502,
             content={"error": {"message": str(exc), "type": "upstream_error"}},
