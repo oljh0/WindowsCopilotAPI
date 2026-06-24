@@ -239,6 +239,39 @@ for chunk in response_reasoning:
 
 ---
 
+## 🤖 智能体编辑模式 (Agent Mode)
+
+除了提供 OpenAI 兼容的 API 服务，本项目还内置了一个**轻量级本地文件编辑智能体 (Agent)**。它能够读取您的本地文件内容，结合您的修改指令，调用微软 Copilot 分析并全自动更新回写原文件，且带有原子级的安全备份回滚机制。
+
+### 使用方法
+在项目根目录下，直接运行 `agent.py` 脚本：
+```bash
+python agent.py -f <目标文件路径> -i "<修改指令>" [-m <模型模式>]
+```
+
+**参数说明**：
+* `-f`, `--file`：目标要修改的本地文件路径（如 `memo.txt`）。
+* `-i`, `--instruction`：对该文件要进行的自然语言修改指令（如 `"请在首行追加：【编辑：Antigravity】，并在末尾追加更新日期"`）。
+* `-m`, `--model`：可选，指定要使用的模型模式，默认为 `copilot-smart`（对于复杂代码文件修改，推荐使用 `copilot-reasoning` 深度思考模式）。
+
+**使用样例**：
+假设您本地有一个 `code.py` 文件，内容如下：
+```python
+def add(a, b):
+    return a + b
+```
+您可以在终端运行 Agent 修改它：
+```bash
+python agent.py -f code.py -i "请为 add 函数添加详细的中文 docstring 解释，并使用 copilot-reasoning 思考模型进行改写" -m copilot-reasoning
+```
+运行后，Agent 将自动调用 Copilot 生成修改方案，并安全自动写回，您只需刷新编辑器即可看到代码已更新。
+
+**安全机制**：
+* **自动安全备份**：在修改任何文件前，Agent 会自动在同级目录下建立 `.bak` 备份文件（如 `code.py.bak`）。
+* **网络与风控容错自动回滚**：如果发生任何网络断开、微软 WAF 拦截或解析异常，Agent 会在控制台发出警告并**自动无感回退还原原文件**，绝对保障原代码/数据的完整性不受损。
+
+---
+
 ## 🐳 使用 Docker 部署（可选）
 
 如果您希望以容器化方式运行服务，请先在宿主机上完成 `python -m copilot login`。由于容器内部通常无法运行带界面的浏览器来完成首次授权，因此需要先在宿主机上生成 `session/` 文件：
