@@ -147,32 +147,34 @@ class Copilot(AbstractProvider):
             yield from self._read_stream(wss, send_frame, timeout)
 
     def _read_stream(self, wss, send_frame: bytes, timeout: int, idle_timeout: int = 60):
-        """Consume chat-socket frames, solving challenges, yielding text/images.
+        """消费 Chat WebSocket 帧，自动求解微软的安全质询 PoW，并生成文本/图像回复。
 
-        ``idle_timeout`` bounds how long we wait for the *next* frame: the chat
-        backend normally answers within a second, so prolonged silence means a
-        stalled socket (or a challenge we failed to answer) — we raise rather
-        than block for the full ``timeout``.
+        ``idle_timeout`` 限制了等待下一帧的空闲超时时长，因为上游通常在几秒内回复。
+        若遇到长时间静默，通常意味着 socket 挂起或质询验证未通过，这会直接抛出超时异常。
         """
         buffer = b""
         is_started = False
         answered = False
         image_prompt = None
         last_msg = None
+        err = None
 
         overall_deadline = time.time() + timeout
         while True:
             idle_deadline = time.time() + idle_timeout
             try:
+                # 从 WebSocket 中阻塞读取一个完整的帧，或者在到达最严格的截止时间时返回 None
                 chunk = self._recv_frame(wss, min(overall_deadline, idle_deadline))
-            except Exception:
-                break  # socket closed/errored -> end of stream
-            if chunk is None:  # deadline passed with no frame
+            except Exception as e:
+                err = e
+                break  # 发生网络读取异常或 socket 被关闭，跳出接收循环
+            
+            if chunk is None:  # 到达超时截止时间但仍未收到任何帧
                 if time.time() >= overall_deadline:
-                    raise TimeoutError(f"Copilot stream exceeded {timeout}s")
+                    raise TimeoutError(f"Copilot 接收流式回复超过了最大时限 {timeout} 秒")
                 raise TimeoutError(
-                    f"Copilot chat socket went silent for {idle_timeout}s; "
-                    f"last frame was {last_msg!r}."
+                    f"Copilot 聊天套接字已连续空闲超过 {idle_timeout} 秒；"
+                    f"收到的最后一个帧数据是：{last_msg!r}。"
                 )
 
             buffer += chunk if isinstance(chunk, (bytes, bytearray)) else chunk.encode()
@@ -180,14 +182,17 @@ class Copilot(AbstractProvider):
             for msg in messages:
                 last_msg = msg
                 event = msg.get("event")
+                
+                # 触发了微软的安全质询 (Proof of Work 挑战)
                 if event == "challenge" and not answered:
                     token = self._solve_challenge(msg)
                     if token is None:
                         raise RuntimeError(
-                            f"Unsolvable Copilot challenge (method={msg.get('method')!r}). "
-                            "Microsoft may have escalated to a browser-only challenge; "
-                            "fall back to copilot.browser.BrowserCopilot."
+                            f"无法在纯 HTTP 模式下解密此 Copilot 安全验证 (方法={msg.get('method')!r})。"
+                            "微软可能升级了质询要求，需要通过浏览器人机交互校验 (如 Turnstile)；"
+                            "请尝试使用备用的 Playwright 浏览器驱动 (copilot.browser.BrowserCopilot)。"
                         )
+                    # 回复安全质询帧
                     wss.send(json.dumps({
                         "event": "challengeResponse",
                         "token": token,
@@ -195,76 +200,86 @@ class Copilot(AbstractProvider):
                         "id": msg.get("id"),
                     }).encode(), CurlWsFlag.TEXT)
                     answered = True
-                    # The client re-sends the held message after a challenge.
+                    # 微软协议规定，在完成 challenge 校验后，客户端必须重新发送一遍被挂起的首条消息帧
                     wss.send(send_frame, CurlWsFlag.TEXT)
+                    
                 elif event == "appendText":
                     is_started = True
                     yield msg.get("text")
+                    
                 elif event == "generatingImage":
                     image_prompt = msg.get("prompt")
+                    
                 elif event == "imageGenerated":
                     yield ImageResponse(msg.get("url"), image_prompt, {"preview": msg.get("thumbnailUrl")})
+                    
                 elif event == "done":
+                    # 回复正常结束，退出流读取
                     return
+                    
                 elif event == "error":
                     code = msg.get("errorCode") or msg
                     if code == "chat-service-unavailable":
                         raise RuntimeError(
-                            "Copilot error: chat-service-unavailable. The chat backend is "
-                            "typically geo-restricted; if you are outside a supported region, "
-                            "retry via a proxy in a supported region, e.g. "
-                            "create_completion(..., proxy='http://user:pass@host:port')."
+                            "Copilot 报错: chat-service-unavailable。聊天服务在您当前的地理区域不可用；"
+                            "如果您处于中国大陆等不受支持的地区，请务必设置全局代理或者为服务传入正确的代理参数，"
+                            "例如: create_completion(..., proxy='http://user:pass@host:port')。"
                         )
-                    raise RuntimeError(f"Copilot error: {code}")
+                    raise RuntimeError(f"Copilot 服务端报错: {code}")
 
+        # 如果连接在正常接收文本前就被异常挂断
         if not is_started:
-            raise RuntimeError(f"Invalid response: {last_msg}")
+            if err is not None:
+                raise RuntimeError(
+                    f"与 Copilot 建立 WebSocket 连接并在开始接收回复前遇到致命网络异常: {err}"
+                ) from err
+            raise RuntimeError(f"无效响应：未收到任何流式回复文本。最后接收到的帧数据：{last_msg}")
 
     @staticmethod
     def _recv_frame(wss, deadline: float):
-        """Block for one complete WS frame, or return ``None`` past ``deadline``.
+        """阻塞并读取一个完整的 WebSocket 帧，直到超时截止时间（时间戳秒）则返回 None。
 
-        Reassembles libcurl's fragments like ``curl_cffi``'s own ``recv()`` but
-        breaks out of the ``CURLE_AGAIN`` wait once ``deadline`` (epoch seconds)
-        is reached, so an idle socket can't hang us indefinitely. Non-AGAIN curl
-        errors (e.g. a closed connection) propagate to the caller.
+        由于 curl_cffi 底层的 `recv_fragment()` 遇到没有数据时会持续返回 `CURLE_AGAIN`，
+        本方法自行驱动分片循环，在遇到 EAGAIN 错误时使用 `select` 监听套接字进行非阻塞睡眠以响应截止时间，
+        从而防止对端由于死锁或断线导致 Python 进程无限挂起。
         """
         sock_fd = wss.curl.getinfo(CurlInfo.ACTIVESOCKET)
         if sock_fd == _CURL_SOCKET_BAD:
-            raise ConnectionError("WebSocket has no active socket")
+            raise ConnectionError("WebSocket 没有可用的活跃底层套接字")
         chunks = []
         while True:
             try:
+                # 尝试拉取 WS 分段片段
                 chunk, frame = wss.recv_fragment()
                 chunks.append(chunk)
+                # 当且仅当剩余分片为 0 且当前帧没有后续 CONT 标志时，才代表本帧接收完毕
                 if frame.bytesleft == 0 and frame.flags & CurlWsFlag.CONT == 0:
                     return b"".join(chunks)
             except CurlError as e:
                 if e.code != CurlECode.AGAIN:
-                    raise
+                    raise  # 抛出非 EAGAIN 的致命连接错误
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    return None
+                    return None  # 到达指定的截止超时时间
+                # 在套接字上进行短时间的 select 监听，防止死循环空转爆 CPU
                 select([sock_fd], [], [], min(0.5, remaining))
 
     @staticmethod
     def _solve_challenge(msg: dict):
-        """Return the challenge-response token, or ``None`` if we can't solve it.
+        """自动求解安全质询，若无法求解（如需要浏览器端 CAPTCHA）则返回 None。
 
-        Copilot's chat socket precedes the answer with a challenge frame that the
-        client must acknowledge. An *empty* challenge (no ``method``/``parameter``)
-        only needs an acknowledging response, so we return an empty token; the
-        proof-of-work variants are computed in :mod:`copilot.challenges`. A
-        ``None`` return means the challenge needs a browser-solved token (e.g. a
-        Cloudflare Turnstile) and the caller should surface that.
+        如果是空的 challenge（即没有任何 method），返回空字符串进行简单应答确认即可。
+        如果是 `hashcash` 算法，在本地调用哈希前缀碰撞求解；
+        如果是 `copilot` 算术公式，执行本地算术解析；
+        如果是 `cloudflare` (Turnstile)，由于纯 HTTP 驱动无法直接模拟人机验证，将返回 None 由调用方决策。
         """
         method = msg.get("method")
         parameter = msg.get("parameter")
         if not method and not parameter:
-            return ""  # empty/no-op challenge: just acknowledge it
+            return ""  # 无操作/空质询：直接应答确认
         if method == "hashcash" and parameter:
             return solve_hashcash(parameter)
         if method == "copilot" and parameter:
             return solve_copilot_challenge(parameter)
-        # 'cloudflare' (Turnstile) / unknown PoW needs a browser-solved token.
+        # cloudflare (Turnstile) 或未知的强验证方法，需降级回 BrowserCopilot 解决
         return None

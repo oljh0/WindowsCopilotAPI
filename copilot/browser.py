@@ -100,17 +100,24 @@ _FIND_TOKEN_JS = """
 
 # Open the chat WebSocket and wire handlers that push into a window-scoped
 # buffer. Returns immediately; messages accumulate while Python polls.
+# 在网页中开启 WebSocket 连接，并在收到消息或遇到错误、完成事件时通过 window.__py_push_event
+# 异步实时将数据推送回 Python 端的队列中，彻底避免轮询开销。
 _START_STREAM_JS = """
 ([url, conversationId, prompt, prelude]) => {
-  const state = {queue: [], done: false, error: null, started: false};
-  window.__copilot = state;
   let ws;
-  try { ws = new WebSocket(url); } catch (e) { state.error = 'ws-init: ' + e; state.done = true; return false; }
+  try { 
+    ws = new WebSocket(url); 
+  } catch (e) { 
+    if (window.__py_push_event) {
+      window.__py_push_event('error', 'ws-init: ' + e).catch(x => {});
+    }
+    return false; 
+  }
   window.__copilotWs = ws;
   ws.onopen = () => {
-    // Initialise the session (setOptions, reportLocalConsents) before sending,
-    // or the backend rejects `send` with invalid-event.
+    // 握手帧发送
     for (const frame of prelude) ws.send(JSON.stringify(frame));
+    // 首条消息发送
     ws.send(JSON.stringify({
       event: 'send',
       conversationId: conversationId,
@@ -123,23 +130,35 @@ _START_STREAM_JS = """
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
     const e = msg.event;
-    if (e === 'appendText') { state.started = true; if (msg.text) state.queue.push(msg.text); }
-    else if (e === 'done') { state.done = true; try { ws.close(); } catch (x) {} }
-    else if (e === 'error') { state.error = JSON.stringify(msg); state.done = true; try { ws.close(); } catch (x) {} }
+    if (e === 'appendText') { 
+      if (msg.text && window.__py_push_event) {
+        window.__py_push_event('text', msg.text).catch(x => {});
+      } 
+    }
+    else if (e === 'done') { 
+      try { ws.close(); } catch (x) {}
+      if (window.__py_push_event) {
+        window.__py_push_event('done', null).catch(x => {});
+      }
+    }
+    else if (e === 'error') { 
+      try { ws.close(); } catch (x) {}
+      if (window.__py_push_event) {
+        window.__py_push_event('error', JSON.stringify(msg)).catch(x => {});
+      }
+    }
   };
-  ws.onerror = () => { state.error = state.error || 'websocket error'; state.done = true; };
-  ws.onclose = () => { state.done = true; };
+  ws.onerror = () => { 
+    if (window.__py_push_event) {
+      window.__py_push_event('error', 'websocket error').catch(x => {});
+    }
+  };
+  ws.onclose = () => { 
+    if (window.__py_push_event) {
+      window.__py_push_event('done', null).catch(x => {});
+    }
+  };
   return true;
-}
-"""
-
-# Drain the buffer and report status in one round-trip.
-_POLL_JS = """
-() => {
-  const s = window.__copilot || {queue: [], done: true, error: 'not started', started: false};
-  const q = s.queue;
-  s.queue = [];
-  return {q: q, done: s.done, error: s.error, started: s.started};
 }
 """
 
@@ -179,6 +198,12 @@ class BrowserCopilot:
         self._context = None
         self._page = None
         self._login_log_fh = None
+        self._event_queue = None
+
+    def _handle_exposed_event(self, event_type: str, data: str):
+        """Playwright expose_function 暴露给 JS 的回调，将收到的帧事件塞入 Python 队列。"""
+        if self._event_queue is not None:
+            self._event_queue.put((event_type, data))
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -210,6 +235,12 @@ class BrowserCopilot:
             # connections open indefinitely, so the network never goes idle and the
             # wait would always time out. A short fixed settle is enough.
             self._page.wait_for_timeout(2000)
+            try:
+                # 注册网页的回调接口，以实现低延迟的事件驱动推送。使用 try-except 防止重复注册异常。
+                self._page.expose_function("__py_push_event", self._handle_exposed_event)
+            except PlaywrightError as pe:
+                if "already" not in str(pe):
+                    raise
         except PlaywrightError as exc:
             self.close()
             raise ConnectionError(f"Failed to start browser: {exc}") from exc
@@ -469,38 +500,54 @@ class BrowserCopilot:
 
         token = self._page.evaluate(_FIND_TOKEN_JS)
 
+        import queue
+        self._event_queue = queue.Queue()
+
         ws_url = f"{CHAT_WEBSOCKET_URL}&clientSessionId={uuid.uuid4()}"
         if token:
             ws_url += f"&accessToken={quote(token)}"
         prelude = [SET_OPTIONS_FRAME, CONSENTS_FRAME]
         started_ok = self._page.evaluate(_START_STREAM_JS, [ws_url, conversation_id, prompt, prelude])
         if started_ok is False:
-            state = self._page.evaluate(_POLL_JS)
-            raise ConnectionError(f"WebSocket failed to start: {state.get('error')}")
+            err_msg = "WebSocket failed to start"
+            try:
+                evt, detail = self._event_queue.get_nowait()
+                if evt == "error":
+                    err_msg = f"WebSocket failed to start: {detail}"
+            except queue.Empty:
+                pass
+            raise ConnectionError(err_msg)
 
         yield from self._pump(timeout)
 
     # -- internals ----------------------------------------------------------
 
     def _pump(self, timeout: int) -> Generator[str, None, None]:
+        """阻塞式消费回调事件队列，实时输出流式文本回复。"""
+        import queue
         deadline = time.time() + timeout
         any_text = False
         while True:
-            state = self._page.evaluate(_POLL_JS)
-            for chunk in state.get("q") or []:
-                if chunk:
-                    any_text = True
-                    yield chunk
-            if state.get("error"):
-                raise RuntimeError(f"Copilot error: {state['error']}")
-            if state.get("done") and not state.get("q"):
-                break
-            if time.time() > deadline:
-                raise TimeoutError(f"No 'done' within {timeout}s")
-            time.sleep(0.08)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"在 {timeout} 秒内未正常接收到结束符 (done)")
+            try:
+                # 每次阻塞等待 2 秒以维持状态轮转和防止无限卡顿
+                evt_type, data = self._event_queue.get(timeout=min(2.0, remaining))
+            except queue.Empty:
+                continue
 
-        if not any_text and not state.get("started"):
-            raise RuntimeError("Invalid response: stream produced no text")
+            if evt_type == "text":
+                if data:
+                    any_text = True
+                    yield data
+            elif evt_type == "error":
+                raise RuntimeError(f"Copilot 浏览器侧异常: {data}")
+            elif evt_type == "done":
+                break
+
+        if not any_text:
+            raise RuntimeError("无效响应：流式回复未产出任何文本")
 
     def _ensure_started(self) -> None:
         if self._context is None or self._page is None:

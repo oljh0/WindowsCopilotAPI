@@ -63,19 +63,21 @@ class ChatStream:
 
 
 class CopilotClient:
-    """A Copilot client: one object, many conversations addressed by id.
+    """高层级 Copilot 客户端：对外部调用屏蔽底层网络质询和 Token 刷新细节。
 
-    Parameters
+    单个客户端对象即可管理多个不同 id 的会话。
+    若调用 `stream()` 或 `chat()` 时提供 `conversation_id` 参数，则会沿用已有会话；
+    若传入 `None`，则会重新初始化并在流的最初吐出新的 conversation 实例以供后续关联。
+
+    参数
     ----------
     anonymous:
-        Skip sign-in and talk to Copilot anonymously. Only works where the
-        anonymous consumer experience is available (it is geo-blocked in some
-        regions, e.g. India). Default ``False`` uses the signed-in session.
+        若为 True 则代表以匿名方式发起请求。匿名会话在某些地理区域是受限的（如中国大陆、印度等）。
+        默认 False 会自动去加载和周期性刷新已登录的微软账户凭证。
     proxy:
-        Optional ``scheme://user:pass@host:port`` proxy, applied to both the
-        auth refresh and every request.
+        全局代理配置字符串，如 "http://127.0.0.1:7890"，将同时应用于 Token 刷新和后续的所有请求。
     max_age:
-        Seconds a cached access token is trusted before it is refreshed.
+        缓存凭证（MSAL 访问令牌）的可信任存活秒数（超时后会自动触发无头浏览器刷新）。
     """
 
     def __init__(
@@ -97,11 +99,10 @@ class CopilotClient:
         mode: str = "smart",
         **kwargs,
     ) -> ChatStream:
-        """Stream the reply to ``prompt`` as a :class:`ChatStream`.
+        """流式获取微软 Copilot 对当前提示词 (prompt) 的回复，返回一个 ChatStream 迭代器。
 
-        Starts a new conversation when ``conversation_id`` is ``None``; otherwise
-        continues that conversation. Read ``.conversation_id`` on the returned
-        stream (during/after iteration) to continue the chat later.
+        若 `conversation_id` 为 None 则是新对话，返回的 ChatStream 在迭代时会在首位吐出
+        对应的 Conversation 实例，从而可以动态获取新会话的 conversation_id。
         """
         auth = self._fresh_auth()
         kw = dict(
@@ -113,7 +114,7 @@ class CopilotClient:
             **kwargs,
         )
         if conversation_id is None:
-            # New conversation: have the driver hand back its id.
+            # 新会话，令底层驱动在生成器首位返回 Conversation 对象
             kw["return_conversation"] = True
         else:
             kw["conversation_id"] = conversation_id
@@ -128,9 +129,9 @@ class CopilotClient:
         mode: str = "smart",
         **kwargs,
     ) -> ChatReply:
-        """Return the full reply to ``prompt`` as a :class:`ChatReply`.
+        """非流式阻塞获取微软 Copilot 对当前提示词 (prompt) 的完整回复。
 
-        Buffers the whole response; use :meth:`stream` for incremental output.
+        常用于无需逐字打字机效果的单次交互。
         """
         s = self.stream(prompt, conversation_id=conversation_id, mode=mode, **kwargs)
         text: List[str] = []
@@ -143,9 +144,10 @@ class CopilotClient:
         return ChatReply("".join(text), s.conversation_id, images)
 
     def _fresh_auth(self) -> Optional[dict]:
-        """Return current signed-in auth, refreshing it when stale (or None)."""
+        """获取当前依然有效的登录态凭证，如已过期或未获取，则在后台拉起无头浏览器自动刷新。"""
         if self._anonymous:
             return None
+        # 如果尚未加载过或者上次保存时间超过了指定的有效期，重新加载/刷新
         if self._auth is None or (time.time() - self._auth.get("saved_at", 0)) >= self._max_age:
             self._auth = load_auth(max_age=self._max_age, proxy=self._proxy)
         return self._auth

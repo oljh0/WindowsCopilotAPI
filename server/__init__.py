@@ -31,12 +31,13 @@ def app(host=None, port=None) -> None:
     before serving, so requests don't fail with a "not signed in" error.
     """
     import curl_cffi.requests as requests
-    print("Pre-initializing curl_cffi on main thread...")
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    print(f"Pre-initializing curl_cffi on main thread (proxy={proxy})...")
     try:
-        res = requests.get("https://www.bing.com", impersonate="chrome", timeout=15)
+        res = requests.get("https://www.bing.com", impersonate="chrome", timeout=3, proxy=proxy)
         print(f"Pre-initialization successful (bing.com): {res.status_code}")
     except Exception as exc:
-        print(f"Pre-initialization failed: {exc}")
+        print(f"Pre-initialization failed (non-fatal, session will still attempt load): {exc}")
     import uvicorn
 
     from copilot.auth import load_auth
